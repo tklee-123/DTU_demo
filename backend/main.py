@@ -6,8 +6,9 @@ from pymongo import MongoClient
 import implicit
 from data_preprocessing import Dataset
 from gridfs import GridFS
-# from kafka import KafkaProducer, KafkaConsumer
+from kafka import KafkaProducer, KafkaConsumer
 import json
+import base64
 app = Flask(__name__)
 CORS(app)
 
@@ -18,17 +19,18 @@ CORS(app)
 # Load pretrained model
 # model = implicit.cpu.als.AlternatingLeastSquares.load('model.npz')
 
-# producer = KafkaProducer(bootstrap_servers='localhost:9092',
-#                          value_serializer=lambda v: json.dumps(v).encode('utf-8'))
-# consumer = KafkaConsumer('topic-send',
-#                          bootstrap_servers='localhost:9092',
-#                          auto_offset_reset='earliest',
-#                          group_id='video-stream-group',
-#                          value_deserializer=lambda x: json.loads(x.decode('utf-8')))
+producer = KafkaProducer(bootstrap_servers='localhost:9092',
+                         value_serializer=lambda v: json.dumps(v).encode('utf-8'))
+consumer = KafkaConsumer('topic-send',
+                         bootstrap_servers='localhost:9092',
+                         auto_offset_reset='earliest',
+                         group_id='video-stream-group',
+                         value_deserializer=lambda x: json.loads(x.decode('utf-8')))
 
 # Connect to MongoDB
-client = MongoClient(
-    'mongodb+srv://admin:admin123@cluster0.jmil5cr.mongodb.net/dtu?retryWrites=true&w=majority&appName=Cluster0')
+# client = MongoClient(
+#     'mongodb+srv://admin:admin123@cluster0.jmil5cr.mongodb.net/dtu?retryWrites=true&w=majority&appName=Cluster0')
+client = MongoClient("mongodb://localhost:27017")
 db = client['dtu']
 grid_fs = GridFS(db)
 
@@ -73,34 +75,67 @@ def get_question():
         return jsonify({'error': 'Internal server error.'}), 500
 
 
+
 @app.route('/openVideo/<qid>', methods=['GET'])
 def open_video(qid):
     try:
-        video_object_id = str(qid)
+        video_object_id = ObjectId(qid)
         range_header = request.headers.get('Range', None)
 
-        # Send video ID and range header to Kafka producer
-        producer.send('topic-send', {'video_id': video_object_id, 'range': range_header})
-        producer.flush()
+        chunks = db.fs.chunks.find({'files_id': video_object_id}).sort('n', 1)
 
-        # Retrieve video chunks from Kafka consumer
-        for message in consumer:
-            video_data = message.value
+        # Send each chunk to the Kafka topic
+        for chunk in chunks:
+            # Encode binary data to Base64
+            data = base64.b64encode(chunk['data']).decode('utf-8')
 
-            if video_data['video_id'] == video_object_id:
-                chunk = video_data['chunk']
-                start = video_data['start']
-                end = video_data['end']
-                total_length = video_data['total_length']
+            # Prepare the message
+            message = {
+                'video_id': str(video_object_id),
+                'chunk': {
+                    '_id': str(chunk['_id']),
+                    'files_id': str(chunk['files_id']),
+                    'n': chunk['n'],
+                    'data': data
+                }
+            }
 
-                response = Response(chunk, status=206, content_type='video/mp4')
-                response.headers['Content-Range'] = f'bytes {start}-{end}/{total_length}'
-                response.headers['Accept-Ranges'] = 'bytes'
-                response.headers['Content-Length'] = str(end - start + 1)
-                return response
+            # Send the message to the Kafka topic
+            producer.send('topic-send', message)
+            producer.flush()
+
+        def generate_chunks():
+            start = end = total_length = None
+
+            for message in consumer:
+                video_data = message.value
+
+                if video_data['video_id'] == str(video_object_id):
+                    chunk = base64.b64decode(video_data['chunk']['data'])
+                    start = start or 0
+                    end = len(chunk) - 1
+                    total_length = video_data.get('total_length', end + 1)
+
+                    # Yield the chunk to be streamed
+                    yield chunk
+
+                    # Break the loop if this is the last chunk
+                    if end + 1 >= total_length:
+                        break
+
+        # Create a response object for streaming
+        response = Response(generate_chunks(), status=206, content_type='video/mp4')
+        response.headers['Accept-Ranges'] = 'bytes'
+        if start is not None and end is not None and total_length is not None:
+            response.headers['Content-Range'] = f'bytes {start}-{end}/{total_length}'
+            response.headers['Content-Length'] = str(end - start + 1)
+        
+        return response
 
     except Exception as e:
-        return jsonify({'error': 'Internal Server Error'}), 500
+        return jsonify({'error': 'Internal Server Error', 'message': str(e)}), 500
+
+
 
     
 
